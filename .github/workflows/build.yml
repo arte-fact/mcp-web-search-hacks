@@ -19,7 +19,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: mcp-web-search-hacks
-            use-cross: false
+            use-cross: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: mcp-web-search-hacks
@@ -27,15 +27,15 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-13
             artifact: mcp-web-search-hacks
-            use-cross: false
+            use-cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: mcp-web-search-hacks
-            use-cross: false
+            use-cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: mcp-web-search-hacks.exe
-            use-cross: false
+            use-cross: true
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.target }}
