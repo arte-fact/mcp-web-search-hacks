@@ -1,0 +1,28 @@
+services:
+  mcp-server:
+    build: .
+    command: ["--bind", "0.0.0.0:3000", "--base-url", "${MCP_BASE_URL}"]
+    environment:
+      MCP_ADMIN_PASSWORD: ${MCP_ADMIN_PASSWORD}
+      RUST_LOG: info
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.mcp.rule=Host(`${MCP_HOST}`)
+      - traefik.http.routers.mcp.entrypoints=websecure
+      - traefik.http.routers.mcp.tls.certresolver=letsencrypt
+      - traefik.http.services.mcp.loadbalancer.server.port=3000
+    restart: unless-stopped
+
+  traefik:
+    image: traefik:v3
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/traefik.yml:/etc/traefik/traefik.yml:ro
+      - traefik-certs:/certs
+    restart: unless-stopped
+
+volumes:
+  traefik-certs:

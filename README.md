@@ -11,6 +11,16 @@ An MCP (Model Context Protocol) server that gives LLMs web access through a head
 
 All tools use a real headless browser, so JS-heavy sites and Cloudflare-protected pages work out of the box.
 
+## Project Structure
+
+This is a Cargo workspace with three crates:
+
+| Crate | Description |
+|-------|-------------|
+| `mcp-web-search-core` | Shared library: browser automation, extraction, server handler |
+| `mcp-web-search-stdio` | Binary: local MCP server over stdio |
+| `mcp-web-search-server` | Binary: remote HTTP server with OAuth 2.1 |
+
 ## Prerequisites
 
 - **Rust** (edition 2024)
@@ -22,21 +32,21 @@ All tools use a real headless browser, so JS-heavy sites and Cloudflare-protecte
 cargo build --release
 ```
 
-The binary is at `target/release/mcp-web-search-hacks`.
+Binaries are at:
+- `target/release/mcp-web-search-stdio` — local stdio server
+- `target/release/mcp-web-search-server` — remote HTTP server
 
-## Usage
+## Local Usage (stdio)
 
-The server communicates over **stdio** using the MCP protocol. It is designed to be launched by an MCP client (e.g. Claude Code, Claude Desktop, or any MCP-compatible host).
+The stdio binary communicates over stdin/stdout using the MCP protocol. It is designed to be launched by an MCP client as a subprocess.
 
 ### Claude Code
-
-Add to your MCP config (`.claude/settings.json` or project settings):
 
 ```json
 {
   "mcpServers": {
     "web-search": {
-      "command": "/path/to/mcp-web-search-hacks"
+      "command": "/path/to/mcp-web-search-stdio"
     }
   }
 }
@@ -50,15 +60,80 @@ Add to `claude_desktop_config.json`:
 {
   "mcpServers": {
     "web-search": {
-      "command": "/path/to/mcp-web-search-hacks"
+      "command": "/path/to/mcp-web-search-stdio"
     }
   }
 }
 ```
 
-### Any MCP client
+## Remote Usage (HTTP + OAuth)
 
-Launch the binary as a subprocess and communicate over stdin/stdout with the MCP protocol.
+The HTTP server exposes an MCP endpoint at `/mcp` with OAuth 2.1 authentication (authorization code flow with PKCE). MCP clients like Claude Desktop and Claude Code handle the OAuth flow automatically.
+
+### Run locally
+
+```sh
+MCP_ADMIN_PASSWORD=secret cargo run -p mcp-web-search-server -- \
+  --bind 127.0.0.1:3000 \
+  --base-url http://localhost:3000
+```
+
+### Connect from Claude Code
+
+```json
+{
+  "mcpServers": {
+    "web-search": {
+      "url": "https://mcp.example.com/mcp"
+    }
+  }
+}
+```
+
+When connecting for the first time, the client will open a browser window for you to enter the admin password.
+
+### Deploy with Docker Compose + Traefik
+
+1. Copy `.env.example` to `.env` and fill in your values:
+
+```sh
+cp .env.example .env
+```
+
+```
+MCP_HOST=mcp.example.com
+MCP_BASE_URL=https://mcp.example.com
+MCP_ADMIN_PASSWORD=your-secure-password
+ACME_EMAIL=you@example.com
+```
+
+2. Start the stack:
+
+```sh
+docker compose up -d
+```
+
+Traefik handles HTTPS with automatic Let's Encrypt certificates.
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MCP_ADMIN_PASSWORD` | **Required.** Password for OAuth authorization |
+| `MCP_BASE_URL` | Public URL of the server (used in OAuth metadata) |
+| `MCP_BIND` | Bind address (default: `127.0.0.1:3000`) |
+| `RUST_LOG` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+
+### OAuth Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /.well-known/oauth-protected-resource` | Protected Resource Metadata (RFC 9728) |
+| `GET /.well-known/oauth-authorization-server` | Authorization Server Metadata (RFC 8414) |
+| `POST /register` | Dynamic Client Registration (RFC 7591) |
+| `GET /authorize` | Authorization page |
+| `POST /token` | Token exchange |
+| `POST /mcp` | MCP endpoint (requires Bearer token) |
 
 ## Tools
 
@@ -127,10 +202,5 @@ Navigate to a URL and perform a sequence of browser actions. Returns the page co
 Logs are written to **stderr** using `tracing`. Control verbosity with the `RUST_LOG` environment variable:
 
 ```sh
-RUST_LOG=info ./target/release/mcp-web-search-hacks
-RUST_LOG=debug ./target/release/mcp-web-search-hacks
+RUST_LOG=info ./target/release/mcp-web-search-server --bind 0.0.0.0:3000 --base-url https://mcp.example.com
 ```
-
-## License
-
-See [Cargo.toml](Cargo.toml) for package metadata.

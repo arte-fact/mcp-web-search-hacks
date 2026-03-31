@@ -9,32 +9,42 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
   build:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: mcp-web-search-hacks
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: mcp-web-search-hacks
             cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: mcp-web-search-hacks
           - target: x86_64-apple-darwin
             os: macos-15-intel
-            artifact: mcp-web-search-hacks
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: mcp-web-search-hacks.exe
 
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.target }}
+    name: build (${{ matrix.target }})
 
     steps:
       - uses: actions/checkout@v4
@@ -63,22 +73,60 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (unix)
+      - name: Package binaries (unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../mcp-web-search-hacks-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          tar czf ../../../mcp-web-search-stdio-${{ matrix.target }}.tar.gz mcp-web-search-stdio
+          tar czf ../../../mcp-web-search-server-${{ matrix.target }}.tar.gz mcp-web-search-server
 
-      - name: Package (windows)
+      - name: Package binaries (windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ../../../mcp-web-search-hacks-${{ matrix.target }}.zip
+          Compress-Archive -Path mcp-web-search-stdio.exe -DestinationPath ../../../mcp-web-search-stdio-${{ matrix.target }}.zip
+          Compress-Archive -Path mcp-web-search-server.exe -DestinationPath ../../../mcp-web-search-server-${{ matrix.target }}.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mcp-web-search-hacks-${{ matrix.target }}
-          path: mcp-web-search-hacks-${{ matrix.target }}.*
+          name: binaries-${{ matrix.target }}
+          path: |
+            mcp-web-search-stdio-${{ matrix.target }}.*
+            mcp-web-search-server-${{ matrix.target }}.*
+
+  docker:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   release:
     needs: build

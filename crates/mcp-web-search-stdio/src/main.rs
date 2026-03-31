@@ -1,8 +1,4 @@
-mod browser;
-mod error;
-mod extraction;
-mod server;
-
+use mcp_web_search_core::{browser::BrowserManager, server::WebServer};
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
@@ -14,11 +10,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("launching headless browser...");
-    let browser_manager = browser::BrowserManager::launch()
-        .map_err(|e| anyhow::anyhow!("failed to launch browser: {e}"))?;
+    let browser_manager =
+        BrowserManager::launch().map_err(|e| anyhow::anyhow!("failed to launch browser: {e}"))?;
     tracing::info!("browser launched successfully");
 
-    let server = server::WebServer::new(browser_manager);
+    let server = WebServer::new(browser_manager);
 
     tracing::info!("starting MCP server on stdio...");
     let service = server.serve(rmcp::transport::io::stdio()).await?;

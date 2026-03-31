@@ -1,19 +1,30 @@
 use std::sync::Arc;
 
+use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, tool};
+use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::browser::BrowserManager;
 
 #[derive(Debug, Clone)]
 pub struct WebServer {
     browser: Arc<BrowserManager>,
+    #[allow(dead_code)]
+    tool_router: ToolRouter<Self>,
 }
 
 impl WebServer {
     pub fn new(browser: BrowserManager) -> Self {
         Self {
             browser: Arc::new(browser),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    pub fn new_with_arc(browser: Arc<BrowserManager>) -> Self {
+        Self {
+            browser,
+            tool_router: Self::tool_router(),
         }
     }
 }
@@ -66,15 +77,15 @@ fn truncate_text(text: String) -> String {
     }
 }
 
-#[tool(tool_box)]
+#[tool_router]
 impl WebServer {
     #[tool(
         description = "Fetch a URL and return its content as clean text. Uses a headless browser to handle JavaScript rendering and Cloudflare challenges."
     )]
     async fn fetch(
         &self,
-        #[tool(aggr)] params: FetchParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
+        Parameters(params): Parameters<FetchParams>,
+    ) -> Result<CallToolResult, McpError> {
         match self
             .browser
             .fetch_page(params.url, params.timeout_secs)
@@ -95,8 +106,8 @@ impl WebServer {
     )]
     async fn search(
         &self,
-        #[tool(aggr)] params: SearchParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
+        Parameters(params): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
         match self.browser.search(params.query, None).await {
             Ok(html) => {
                 let mut results = crate::extraction::parse_duckduckgo_results(&html);
@@ -130,8 +141,8 @@ impl WebServer {
     #[tool(description = "Take a screenshot of a URL and return it as a base64-encoded PNG image.")]
     async fn screenshot(
         &self,
-        #[tool(aggr)] params: ScreenshotParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
+        Parameters(params): Parameters<ScreenshotParams>,
+    ) -> Result<CallToolResult, McpError> {
         match self
             .browser
             .screenshot_page(params.url, params.timeout_secs)
@@ -154,8 +165,8 @@ impl WebServer {
     )]
     async fn interact(
         &self,
-        #[tool(aggr)] params: InteractParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
+        Parameters(params): Parameters<InteractParams>,
+    ) -> Result<CallToolResult, McpError> {
         match self
             .browser
             .interact_page(params.url, params.actions, params.timeout_secs)
@@ -177,18 +188,14 @@ impl WebServer {
     }
 }
 
-#[tool(tool_box)]
+#[tool_handler]
 impl ServerHandler for WebServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some(
-                "Web access server with Cloudflare bypass. Provides tools to fetch web pages, \
-                 search the web, take screenshots, and interact with pages. Handles JavaScript \
-                 rendering and Cloudflare challenges automatically using a headless browser."
-                    .into(),
-            ),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Web access server with Cloudflare bypass. Provides tools to fetch web pages, \
+             search the web, take screenshots, and interact with pages. Handles JavaScript \
+             rendering and Cloudflare challenges automatically using a headless browser."
+                .to_string(),
+        )
     }
 }
