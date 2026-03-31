@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rmcp::model::{CallToolResult, Content, ServerInfo};
+use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool};
 
 use crate::browser::BrowserManager;
@@ -181,6 +181,7 @@ impl WebServer {
 impl ServerHandler for WebServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(
                 "Web access server with Cloudflare bypass. Provides tools to fetch web pages, \
                  search the web, take screenshots, and interact with pages. Handles JavaScript \
