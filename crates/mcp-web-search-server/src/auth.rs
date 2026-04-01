@@ -81,6 +81,8 @@ pub fn router(state: Arc<OAuthState>) -> Router {
 struct ProtectedResourceMetadata {
     resource: String,
     authorization_servers: Vec<String>,
+    bearer_methods_supported: Vec<String>,
+    scopes_supported: Vec<String>,
 }
 
 async fn protected_resource_metadata_handler(
@@ -89,6 +91,8 @@ async fn protected_resource_metadata_handler(
     Json(ProtectedResourceMetadata {
         resource: state.base_url.clone(),
         authorization_servers: vec![state.base_url.clone()],
+        bearer_methods_supported: vec!["header".into()],
+        scopes_supported: vec!["mcp".into()],
     })
 }
 
@@ -104,6 +108,7 @@ struct AuthorizationServerMetadata {
     grant_types_supported: Vec<String>,
     code_challenge_methods_supported: Vec<String>,
     token_endpoint_auth_methods_supported: Vec<String>,
+    scopes_supported: Vec<String>,
 }
 
 async fn metadata_handler(
@@ -118,6 +123,7 @@ async fn metadata_handler(
         grant_types_supported: vec!["authorization_code".into()],
         code_challenge_methods_supported: vec!["S256".into()],
         token_endpoint_auth_methods_supported: vec!["client_secret_post".into()],
+        scopes_supported: vec!["mcp".into()],
     })
 }
 
@@ -201,6 +207,27 @@ async fn authorize_page(
         ));
     }
 
+    // PKCE is mandatory per MCP spec (2025-11-25)
+    let code_challenge = match q.code_challenge.as_deref() {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "code_challenge is required (PKCE is mandatory)".to_string(),
+            ));
+        }
+    };
+
+    match q.code_challenge_method.as_deref() {
+        Some("S256") => {}
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "code_challenge_method must be S256".to_string(),
+            ));
+        }
+    }
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -221,7 +248,7 @@ button:hover {{ background: #1d4ed8; }}
   <input type="hidden" name="redirect_uri" value="{redirect_uri}">
   <input type="hidden" name="state" value="{state}">
   <input type="hidden" name="code_challenge" value="{code_challenge}">
-  <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
+  <input type="hidden" name="code_challenge_method" value="S256">
   <label>Admin Password</label>
   <input type="password" name="password" autofocus required>
   <button type="submit">Approve</button>
@@ -231,8 +258,7 @@ button:hover {{ background: #1d4ed8; }}
         client_id = q.client_id,
         redirect_uri = q.redirect_uri,
         state = q.state.as_deref().unwrap_or(""),
-        code_challenge = q.code_challenge.as_deref().unwrap_or(""),
-        code_challenge_method = q.code_challenge_method.as_deref().unwrap_or(""),
+        code_challenge = code_challenge,
         scope = q
             .scope
             .as_ref()
@@ -372,27 +398,25 @@ async fn token_handler(
         ));
     }
 
-    // PKCE verification
-    if !entry.code_challenge.is_empty() {
-        let verifier = req.code_verifier.as_deref().ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(TokenError {
-                    error: "invalid_grant".into(),
-                    error_description: "code_verifier required".into(),
-                }),
-            )
-        })?;
+    // PKCE verification (mandatory per MCP spec 2025-11-25)
+    let verifier = req.code_verifier.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(TokenError {
+                error: "invalid_grant".into(),
+                error_description: "code_verifier is required (PKCE is mandatory)".into(),
+            }),
+        )
+    })?;
 
-        if !verify_pkce(verifier, &entry.code_challenge) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(TokenError {
-                    error: "invalid_grant".into(),
-                    error_description: "PKCE verification failed".into(),
-                }),
-            ));
-        }
+    if !verify_pkce(verifier, &entry.code_challenge) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(TokenError {
+                error: "invalid_grant".into(),
+                error_description: "PKCE verification failed".into(),
+            }),
+        ));
     }
 
     let access_token = Uuid::new_v4().to_string();

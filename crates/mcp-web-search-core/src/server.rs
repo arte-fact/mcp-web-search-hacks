@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 
 use crate::browser::BrowserManager;
@@ -80,7 +80,12 @@ fn truncate_text(text: String) -> String {
 #[tool_router]
 impl WebServer {
     #[tool(
-        description = "Fetch a URL and return its content as clean text. Uses a headless browser to handle JavaScript rendering and Cloudflare challenges."
+        description = "Fetch a URL and return its content as clean text. Uses a headless browser to handle JavaScript rendering and Cloudflare challenges.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn fetch(
         &self,
@@ -102,7 +107,12 @@ impl WebServer {
     }
 
     #[tool(
-        description = "Search the web and return a list of results with titles, URLs, and snippets."
+        description = "Search the web and return a list of results with titles, URLs, and snippets.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn search(
         &self,
@@ -138,7 +148,14 @@ impl WebServer {
         }
     }
 
-    #[tool(description = "Take a screenshot of a URL and return it as a base64-encoded PNG image.")]
+    #[tool(
+        description = "Take a screenshot of a URL and return it as a base64-encoded PNG image.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
     async fn screenshot(
         &self,
         Parameters(params): Parameters<ScreenshotParams>,
@@ -161,7 +178,12 @@ impl WebServer {
     }
 
     #[tool(
-        description = "Navigate to a URL and perform a sequence of interactions (click, type_text, wait, scroll, press_key). Returns the page content and a screenshot after all actions complete."
+        description = "Navigate to a URL and perform a sequence of interactions (click, type_text, wait, scroll, press_key). Returns the page content and a screenshot after all actions complete.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn interact(
         &self,
@@ -191,11 +213,13 @@ impl WebServer {
 #[tool_handler]
 impl ServerHandler for WebServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Web access server with Cloudflare bypass. Provides tools to fetch web pages, \
-             search the web, take screenshots, and interact with pages. Handles JavaScript \
-             rendering and Cloudflare challenges automatically using a headless browser."
-                .to_string(),
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("mcp-web-search", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Web access server with Cloudflare bypass. Provides tools to fetch web pages, \
+                 search the web, take screenshots, and interact with pages. Handles JavaScript \
+                 rendering and Cloudflare challenges automatically using a headless browser."
+                    .to_string(),
+            )
     }
 }
