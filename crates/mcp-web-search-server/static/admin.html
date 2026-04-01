@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP Admin</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #232733;
+  --border: #2e3345;
+  --text: #e1e4ed;
+  --text2: #8b90a0;
+  --accent: #5b8af5;
+  --accent-hover: #4a78e0;
+  --green: #34d399;
+  --red: #f87171;
+  --yellow: #fbbf24;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+/* Login */
+#login { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+#login form { background: var(--surface); padding: 2rem; border-radius: 8px; border: 1px solid var(--border); width: 340px; }
+#login h1 { font-size: 1.2rem; margin-bottom: 1rem; }
+#login input { width: 100%; padding: 0.5rem 0.75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: 0.9rem; margin-bottom: 1rem; }
+#login input:focus { outline: none; border-color: var(--accent); }
+#login button { width: 100%; padding: 0.5rem; background: var(--accent); color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+#login button:hover { background: var(--accent-hover); }
+#login .error { color: var(--red); font-size: 0.85rem; margin-bottom: 0.5rem; display: none; }
+
+/* App shell */
+#app { display: none; }
+nav { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 1.5rem; display: flex; align-items: center; gap: 0; height: 48px; }
+nav .brand { font-weight: 600; margin-right: 2rem; font-size: 0.95rem; }
+nav a { color: var(--text2); text-decoration: none; padding: 0.75rem 1rem; font-size: 0.85rem; border-bottom: 2px solid transparent; transition: color 0.15s; }
+nav a:hover { color: var(--text); }
+nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
+nav .spacer { flex: 1; }
+nav .logout { color: var(--text2); background: none; border: none; cursor: pointer; font-size: 0.85rem; padding: 0.5rem; }
+nav .logout:hover { color: var(--red); }
+main { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
+
+/* Dashboard cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; }
+.card .label { font-size: 0.8rem; color: var(--text2); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+.card .value { font-size: 1.8rem; font-weight: 600; }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-size: 0.85rem; }
+th { text-align: left; padding: 0.75rem 1rem; background: var(--surface2); color: var(--text2); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
+td { padding: 0.6rem 1rem; border-top: 1px solid var(--border); }
+tr:hover td { background: var(--surface2); }
+.badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.75rem; font-weight: 500; }
+.badge-ok { background: rgba(52,211,153,0.15); color: var(--green); }
+.badge-err { background: rgba(248,113,113,0.15); color: var(--red); }
+.btn-danger { background: none; border: 1px solid var(--red); color: var(--red); padding: 0.25rem 0.6rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+.btn-danger:hover { background: var(--red); color: #fff; }
+
+/* Pagination */
+.pagination { display: flex; align-items: center; justify-content: space-between; margin-top: 1rem; font-size: 0.85rem; color: var(--text2); }
+.pagination button { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 0.3rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+.pagination button:disabled { opacity: 0.4; cursor: default; }
+.pagination button:hover:not(:disabled) { background: var(--border); }
+
+/* Truncated text */
+.truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mono { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 0.8rem; }
+
+.empty { text-align: center; padding: 2rem; color: var(--text2); }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <form onsubmit="doLogin(event)">
+    <h1>MCP Admin</h1>
+    <div class="error" id="login-error">Invalid password</div>
+    <input type="password" id="login-password" placeholder="Admin password" autofocus required>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+
+<div id="app">
+  <nav>
+    <span class="brand">MCP Admin</span>
+    <a href="#dashboard" data-view="dashboard">Dashboard</a>
+    <a href="#logs" data-view="logs">Logs</a>
+    <a href="#clients" data-view="clients">Clients</a>
+    <a href="#tokens" data-view="tokens">Tokens</a>
+    <span class="spacer"></span>
+    <button class="logout" onclick="doLogout()">Logout</button>
+  </nav>
+  <main id="content"></main>
+</div>
+
+<script>
+const API = '/admin/api';
+let currentView = 'dashboard';
+let logOffset = 0;
+const LOG_LIMIT = 50;
+let refreshTimer = null;
+
+// --- Auth ---
+
+async function doLogin(e) {
+  e.preventDefault();
+  const pw = document.getElementById('login-password').value;
+  const res = await fetch(`${API}/login`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: pw}),
+  });
+  if (res.ok) {
+    document.getElementById('login').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    navigate(location.hash.slice(1) || 'dashboard');
+  } else {
+    const err = document.getElementById('login-error');
+    err.style.display = 'block';
+    document.getElementById('login-password').value = '';
+    document.getElementById('login-password').focus();
+  }
+}
+
+async function doLogout() {
+  await fetch(`${API}/logout`, {method: 'POST'});
+  location.reload();
+}
+
+async function api(path) {
+  const res = await fetch(`${API}${path}`);
+  if (res.status === 401) { location.reload(); return null; }
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function apiDelete(path) {
+  const res = await fetch(`${API}${path}`, {method: 'DELETE'});
+  if (res.status === 401) { location.reload(); return false; }
+  return res.ok;
+}
+
+// --- Navigation ---
+
+function navigate(view) {
+  if (!['dashboard','logs','clients','tokens'].includes(view)) view = 'dashboard';
+  currentView = view;
+  location.hash = view;
+  document.querySelectorAll('nav a').forEach(a => {
+    a.classList.toggle('active', a.dataset.view === view);
+  });
+  logOffset = 0;
+  render();
+  startAutoRefresh();
+}
+
+function startAutoRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => render(), 5000);
+}
+
+window.addEventListener('hashchange', () => navigate(location.hash.slice(1)));
+
+// --- Render ---
+
+async function render() {
+  const c = document.getElementById('content');
+  switch (currentView) {
+    case 'dashboard': return renderDashboard(c);
+    case 'logs': return renderLogs(c);
+    case 'clients': return renderClients(c);
+    case 'tokens': return renderTokens(c);
+  }
+}
+
+function fmtTime(epochMs) {
+  return new Date(epochMs).toLocaleString();
+}
+
+function fmtDuration(secs) {
+  if (secs >= 3600) return `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m`;
+  if (secs >= 60) return `${Math.floor(secs/60)}m ${secs%60}s`;
+  return `${secs}s`;
+}
+
+function fmtUptime(secs) {
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${secs % 60}s`;
+}
+
+// --- Dashboard ---
+
+async function renderDashboard(c) {
+  const d = await api('/dashboard');
+  if (!d) return;
+  c.innerHTML = `
+    <div class="cards">
+      <div class="card"><div class="label">Total Requests</div><div class="value">${d.total_requests}</div></div>
+      <div class="card"><div class="label">Requests / min</div><div class="value">${d.requests_per_minute.toFixed(1)}</div></div>
+      <div class="card"><div class="label">Active Clients</div><div class="value">${d.active_clients}</div></div>
+      <div class="card"><div class="label">Active Tokens</div><div class="value">${d.active_tokens}</div></div>
+      <div class="card"><div class="label">Uptime</div><div class="value">${fmtUptime(d.uptime_secs)}</div></div>
+    </div>`;
+}
+
+// --- Logs ---
+
+async function renderLogs(c) {
+  const d = await api(`/logs?limit=${LOG_LIMIT}&offset=${logOffset}`);
+  if (!d) return;
+  if (d.entries.length === 0) {
+    c.innerHTML = '<div class="empty">No requests logged yet.</div>';
+    return;
+  }
+  const rows = d.entries.map(e => `
+    <tr>
+      <td>${fmtTime(e.timestamp_epoch_ms)}</td>
+      <td>${e.method}</td>
+      <td>${e.tool_name || '-'}</td>
+      <td class="truncate mono">${e.params_summary ? escHtml(e.params_summary) : '-'}</td>
+      <td>${e.duration_ms}ms</td>
+      <td><span class="badge ${e.success ? 'badge-ok' : 'badge-err'}">${e.success ? 'OK' : 'ERR'}</span></td>
+      <td class="mono">${e.token_prefix || '-'}</td>
+    </tr>`).join('');
+
+  const page = Math.floor(logOffset / LOG_LIMIT) + 1;
+  const totalPages = Math.ceil(d.total / LOG_LIMIT);
+
+  c.innerHTML = `
+    <table>
+      <thead><tr><th>Time</th><th>Method</th><th>Tool</th><th>Params</th><th>Duration</th><th>Status</th><th>Token</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="pagination">
+      <span>Page ${page} of ${totalPages} (${d.total} total)</span>
+      <span>
+        <button onclick="prevPage()" ${logOffset === 0 ? 'disabled' : ''}>Prev</button>
+        <button onclick="nextPage()" ${logOffset + LOG_LIMIT >= d.total ? 'disabled' : ''}>Next</button>
+      </span>
+    </div>`;
+}
+
+function prevPage() { logOffset = Math.max(0, logOffset - LOG_LIMIT); render(); }
+function nextPage() { logOffset += LOG_LIMIT; render(); }
+
+// --- Clients ---
+
+async function renderClients(c) {
+  const d = await api('/clients');
+  if (!d) return;
+  if (d.clients.length === 0) {
+    c.innerHTML = '<div class="empty">No registered clients.</div>';
+    return;
+  }
+  const rows = d.clients.map(cl => `
+    <tr>
+      <td class="mono">${cl.client_id.slice(0, 8)}...</td>
+      <td>${cl.client_name || '-'}</td>
+      <td>${cl.redirect_uris.join(', ')}</td>
+      <td>${fmtTime(cl.registered_at_epoch_ms)}</td>
+      <td>${cl.active_tokens}</td>
+      <td><button class="btn-danger" onclick="revokeClient('${cl.client_id}')">Revoke</button></td>
+    </tr>`).join('');
+
+  c.innerHTML = `
+    <table>
+      <thead><tr><th>Client ID</th><th>Name</th><th>Redirect URIs</th><th>Registered</th><th>Tokens</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function revokeClient(id) {
+  if (!confirm('Revoke this client and all its tokens?')) return;
+  await apiDelete(`/clients/${id}`);
+  render();
+}
+
+// --- Tokens ---
+
+async function renderTokens(c) {
+  const d = await api('/tokens');
+  if (!d) return;
+  if (d.tokens.length === 0) {
+    c.innerHTML = '<div class="empty">No active tokens.</div>';
+    return;
+  }
+  const rows = d.tokens.map(t => `
+    <tr>
+      <td class="mono">${t.token_prefix}...</td>
+      <td class="mono">${t.client_id.slice(0, 8)}...</td>
+      <td>${fmtTime(t.created_at_epoch_ms)}</td>
+      <td>${fmtDuration(t.remaining_secs)}</td>
+      <td><button class="btn-danger" onclick="revokeToken('${t.token_prefix}')">Revoke</button></td>
+    </tr>`).join('');
+
+  c.innerHTML = `
+    <table>
+      <thead><tr><th>Token</th><th>Client</th><th>Created</th><th>Remaining</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function revokeToken(prefix) {
+  if (!confirm('Revoke this token?')) return;
+  await apiDelete(`/tokens/${prefix}`);
+  render();
+}
+
+// --- Utils ---
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// --- Init ---
+
+(async function init() {
+  // Check if already authenticated
+  const res = await fetch(`${API}/dashboard`);
+  if (res.ok) {
+    document.getElementById('login').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    navigate(location.hash.slice(1) || 'dashboard');
+  }
+})();
+</script>
+</body>
+</html>

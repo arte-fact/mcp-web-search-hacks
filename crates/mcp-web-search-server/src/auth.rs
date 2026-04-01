@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -27,7 +27,9 @@ pub struct OAuthState {
 struct RegisteredClient {
     #[allow(dead_code)]
     client_secret: String,
+    client_name: Option<String>,
     redirect_uris: Vec<String>,
+    registered_at_epoch_ms: u64,
 }
 
 struct AuthCodeEntry {
@@ -38,7 +40,9 @@ struct AuthCodeEntry {
 }
 
 struct TokenEntry {
+    client_id: String,
     created_at: Instant,
+    created_at_epoch_ms: u64,
     expires_in: Duration,
 }
 
@@ -150,11 +154,18 @@ async fn register_handler(
     let client_id = Uuid::new_v4().to_string();
     let client_secret = Uuid::new_v4().to_string();
 
+    let now_epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     state.clients.write().await.insert(
         client_id.clone(),
         RegisteredClient {
             client_secret: client_secret.clone(),
+            client_name: req.client_name.clone(),
             redirect_uris: req.redirect_uris.clone(),
+            registered_at_epoch_ms: now_epoch_ms,
         },
     );
 
@@ -420,10 +431,16 @@ async fn token_handler(
     }
 
     let access_token = Uuid::new_v4().to_string();
+    let now_epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     state.access_tokens.write().await.insert(
         access_token.clone(),
         TokenEntry {
+            client_id: req.client_id.clone(),
             created_at: Instant::now(),
+            created_at_epoch_ms: now_epoch_ms,
             expires_in: TOKEN_TTL,
         },
     );
@@ -442,6 +459,111 @@ fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
     let hash = sha2::Sha256::digest(code_verifier.as_bytes());
     let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
     computed == code_challenge
+}
+
+// --- Auth Middleware ---
+
+// --- Admin Accessors ---
+
+#[derive(Serialize)]
+pub(crate) struct ClientInfo {
+    pub client_id: String,
+    pub client_name: Option<String>,
+    pub redirect_uris: Vec<String>,
+    pub registered_at_epoch_ms: u64,
+    pub active_tokens: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TokenInfo {
+    pub token_prefix: String,
+    pub client_id: String,
+    pub created_at_epoch_ms: u64,
+    pub expires_in_secs: u64,
+    pub remaining_secs: u64,
+}
+
+impl OAuthState {
+    pub(crate) fn verify_admin_password(&self, password: &str) -> bool {
+        self.admin_password == password
+    }
+
+    pub(crate) async fn list_clients(&self) -> Vec<ClientInfo> {
+        let clients = self.clients.read().await;
+        let tokens = self.access_tokens.read().await;
+        clients
+            .iter()
+            .map(|(id, c)| {
+                let active_tokens = tokens
+                    .values()
+                    .filter(|t| t.client_id == *id && t.created_at.elapsed() < t.expires_in)
+                    .count();
+                ClientInfo {
+                    client_id: id.clone(),
+                    client_name: c.client_name.clone(),
+                    redirect_uris: c.redirect_uris.clone(),
+                    registered_at_epoch_ms: c.registered_at_epoch_ms,
+                    active_tokens,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) async fn list_tokens(&self) -> Vec<TokenInfo> {
+        let tokens = self.access_tokens.read().await;
+        tokens
+            .iter()
+            .filter_map(|(full_token, t)| {
+                let elapsed = t.created_at.elapsed();
+                if elapsed >= t.expires_in {
+                    return None;
+                }
+                let remaining = t.expires_in - elapsed;
+                Some(TokenInfo {
+                    token_prefix: full_token[..8.min(full_token.len())].to_string(),
+                    client_id: t.client_id.clone(),
+                    created_at_epoch_ms: t.created_at_epoch_ms,
+                    expires_in_secs: t.expires_in.as_secs(),
+                    remaining_secs: remaining.as_secs(),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn revoke_client(&self, client_id: &str) -> bool {
+        let removed = self.clients.write().await.remove(client_id).is_some();
+        if removed {
+            self.access_tokens
+                .write()
+                .await
+                .retain(|_, t| t.client_id != client_id);
+        }
+        removed
+    }
+
+    pub(crate) async fn revoke_token(&self, token_prefix: &str) -> bool {
+        let mut tokens = self.access_tokens.write().await;
+        let key = tokens
+            .keys()
+            .find(|k| k.starts_with(token_prefix))
+            .cloned();
+        match key {
+            Some(k) => tokens.remove(&k).is_some(),
+            None => false,
+        }
+    }
+
+    pub(crate) async fn active_client_count(&self) -> usize {
+        self.clients.read().await.len()
+    }
+
+    pub(crate) async fn active_token_count(&self) -> usize {
+        let tokens = self.access_tokens.read().await;
+        tokens
+            .values()
+            .filter(|t| t.created_at.elapsed() < t.expires_in)
+            .count()
+    }
 }
 
 // --- Auth Middleware ---

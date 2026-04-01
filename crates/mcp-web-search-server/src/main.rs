@@ -1,3 +1,4 @@
+mod admin;
 mod auth;
 
 use std::sync::Arc;
@@ -56,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let oauth_state = Arc::new(auth::OAuthState::new(admin_password, args.base_url.clone()));
+    let admin_state = Arc::new(admin::AdminState::new());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -65,16 +67,30 @@ async fn main() -> anyhow::Result<()> {
     // Public OAuth endpoints
     let oauth_routes = auth::router(oauth_state.clone()).layer(cors);
 
-    // Protected MCP endpoint
-    let mcp_routes = Router::new().nest_service("/mcp", mcp_service).layer(
-        axum::middleware::from_fn_with_state(oauth_state.clone(), auth::auth_middleware),
-    );
+    // Protected MCP endpoint with request logging
+    let mcp_routes = Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::logging_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            oauth_state.clone(),
+            auth::auth_middleware,
+        ));
 
-    let app = Router::new().merge(oauth_routes).merge(mcp_routes);
+    // Admin panel
+    let admin_routes = admin::router(oauth_state.clone(), admin_state.clone());
+
+    let app = Router::new()
+        .merge(oauth_routes)
+        .merge(mcp_routes)
+        .merge(admin_routes);
 
     let listener = TcpListener::bind(&args.bind).await?;
     tracing::info!("MCP HTTP server listening on {}", args.bind);
     tracing::info!("base URL: {}", args.base_url);
+    tracing::info!("admin panel: {}/admin", args.base_url);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
