@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -20,6 +20,10 @@ use crate::auth::OAuthState;
 
 const MAX_LOG_ENTRIES: usize = 1000;
 const ADMIN_SESSION_TTL: Duration = Duration::from_secs(86400); // 24 hours
+/// Max MCP request body we'll buffer for logging. Large enough for typical
+/// `interact` payloads; oversize requests get 413 rather than being silently
+/// truncated to an empty body (which would corrupt JSON-RPC and kill the session).
+const MAX_LOGGED_BODY_BYTES: usize = 1024 * 1024;
 
 // --- State ---
 
@@ -38,6 +42,14 @@ impl AdminState {
             start_time: Instant::now(),
             next_log_id: AtomicU64::new(1),
         }
+    }
+
+    /// Prune expired admin sessions. Returns the number evicted.
+    pub(crate) async fn evict_expired_sessions(&self) -> usize {
+        let mut sessions = self.admin_sessions.write().await;
+        let before = sessions.len();
+        sessions.retain(|_, created_at| created_at.elapsed() < ADMIN_SESSION_TTL);
+        before - sessions.len()
     }
 }
 
@@ -110,11 +122,15 @@ pub async fn logging_middleware(
         .map(|t| t[..8.min(t.len())].to_string());
 
     let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+    let bytes = match axum::body::to_bytes(body, MAX_LOGGED_BODY_BYTES).await {
         Ok(b) => b,
-        Err(_) => {
-            let request = Request::from_parts(parts, Body::empty());
-            return next.run(request).await;
+        Err(e) => {
+            tracing::warn!(error = %e, limit = MAX_LOGGED_BODY_BYTES, "request body exceeded log buffer cap");
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeds {MAX_LOGGED_BODY_BYTES} byte limit"),
+            )
+                .into_response();
         }
     };
 
@@ -155,9 +171,7 @@ pub async fn logging_middleware(
     response
 }
 
-fn parse_jsonrpc_for_logging(
-    bytes: &[u8],
-) -> (Option<String>, Option<String>, Option<String>) {
+fn parse_jsonrpc_for_logging(bytes: &[u8]) -> (Option<String>, Option<String>, Option<String>) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return (None, None, None);
     };
@@ -167,17 +181,14 @@ fn parse_jsonrpc_for_logging(
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
         .map(String::from);
-    let params_summary = v
-        .get("params")
-        .and_then(|p| p.get("arguments"))
-        .map(|a| {
-            let s = a.to_string();
-            if s.len() > 200 {
-                format!("{}...", &s[..200])
-            } else {
-                s
-            }
-        });
+    let params_summary = v.get("params").and_then(|p| p.get("arguments")).map(|a| {
+        let s = a.to_string();
+        if s.len() > 200 {
+            format!("{}...", &s[..200])
+        } else {
+            s
+        }
+    });
     (method, tool_name, params_summary)
 }
 
@@ -217,8 +228,7 @@ async fn admin_auth_middleware(
 fn parse_admin_session_cookie(cookie_header: &str) -> Option<String> {
     cookie_header.split(';').find_map(|part| {
         let part = part.trim();
-        part.strip_prefix("admin_session=")
-            .map(|v| v.to_string())
+        part.strip_prefix("admin_session=").map(|v| v.to_string())
     })
 }
 
@@ -236,7 +246,10 @@ async fn admin_login(
     let (oauth, admin) = state.as_ref();
 
     if !oauth.verify_admin_password(&req.password) {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "invalid password"})))
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "invalid password"})),
+        )
             .into_response();
     }
 
@@ -251,9 +264,7 @@ async fn admin_login(
         StatusCode::OK,
         [(
             "Set-Cookie",
-            format!(
-                "admin_session={session_id}; HttpOnly; SameSite=Strict; Path=/admin"
-            ),
+            format!("admin_session={session_id}; HttpOnly; SameSite=Strict; Path=/admin"),
         )],
         Json(serde_json::json!({"ok": true})),
     )
@@ -351,13 +362,8 @@ async fn logs_handler(
     let offset = q.offset.unwrap_or(0);
 
     // Return newest first
-    let entries: Vec<RequestLogEntry> = log
-        .iter()
-        .rev()
-        .skip(offset)
-        .take(limit)
-        .cloned()
-        .collect();
+    let entries: Vec<RequestLogEntry> =
+        log.iter().rev().skip(offset).take(limit).cloned().collect();
 
     Json(LogsResponse { entries, total })
 }

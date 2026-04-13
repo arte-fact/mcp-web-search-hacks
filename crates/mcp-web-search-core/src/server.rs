@@ -214,7 +214,10 @@ impl WebServer {
 impl ServerHandler for WebServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("mcp-web-search", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "mcp-web-search",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(
                 "Web access server with Cloudflare bypass. Provides tools to fetch web pages, \
                  search the web, take screenshots, and interact with pages. Handles JavaScript \

@@ -22,6 +22,7 @@ pub struct OAuthState {
     clients: RwLock<HashMap<String, RegisteredClient>>,
     auth_codes: RwLock<HashMap<String, AuthCodeEntry>>,
     access_tokens: RwLock<HashMap<String, TokenEntry>>,
+    refresh_tokens: RwLock<HashMap<String, RefreshTokenEntry>>,
 }
 
 struct RegisteredClient {
@@ -47,8 +48,15 @@ struct TokenEntry {
     expires_in: Duration,
 }
 
+struct RefreshTokenEntry {
+    client_id: String,
+    created_at: Instant,
+    expires_in: Duration,
+}
+
 const AUTH_CODE_TTL: Duration = Duration::from_secs(600);
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
+const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const MAX_ADMIN_TOKEN_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Sentinel client_id for bearer tokens minted directly from the admin panel
@@ -65,6 +73,7 @@ impl OAuthState {
             clients: RwLock::new(HashMap::new()),
             auth_codes: RwLock::new(HashMap::new()),
             access_tokens: RwLock::new(HashMap::new()),
+            refresh_tokens: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -132,7 +141,7 @@ async fn metadata_handler(
         token_endpoint: format!("{}/token", state.base_url),
         registration_endpoint: format!("{}/register", state.base_url),
         response_types_supported: vec!["code".into()],
-        grant_types_supported: vec!["authorization_code".into()],
+        grant_types_supported: vec!["authorization_code".into(), "refresh_token".into()],
         code_challenge_methods_supported: vec!["S256".into()],
         token_endpoint_auth_methods_supported: vec!["client_secret_post".into()],
         scopes_supported: vec!["mcp".into()],
@@ -337,10 +346,14 @@ async fn authorize_submit(
 #[derive(Deserialize)]
 struct TokenRequest {
     grant_type: String,
-    code: String,
-    client_id: String,
+    // authorization_code grant
+    code: Option<String>,
     redirect_uri: Option<String>,
     code_verifier: Option<String>,
+    // refresh_token grant
+    refresh_token: Option<String>,
+    // common
+    client_id: String,
 }
 
 #[derive(Serialize)]
@@ -348,6 +361,7 @@ struct TokenResponse {
     access_token: String,
     token_type: String,
     expires_in: u64,
+    refresh_token: String,
 }
 
 #[derive(Serialize)]
@@ -356,97 +370,129 @@ struct TokenError {
     error_description: String,
 }
 
+fn bad_grant(desc: &str) -> (StatusCode, Json<TokenError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(TokenError {
+            error: "invalid_grant".into(),
+            error_description: desc.into(),
+        }),
+    )
+}
+
 async fn token_handler(
     State(state): State<Arc<OAuthState>>,
     Form(req): Form<TokenRequest>,
 ) -> Result<Json<TokenResponse>, (StatusCode, Json<TokenError>)> {
-    if req.grant_type != "authorization_code" {
-        return Err((
+    match req.grant_type.as_str() {
+        "authorization_code" => handle_authorization_code(&state, req).await,
+        "refresh_token" => handle_refresh_token(&state, req).await,
+        _ => Err((
             StatusCode::BAD_REQUEST,
             Json(TokenError {
                 error: "unsupported_grant_type".into(),
-                error_description: "only authorization_code is supported".into(),
+                error_description: "only authorization_code and refresh_token are supported".into(),
             }),
-        ));
+        )),
     }
+}
+
+async fn handle_authorization_code(
+    state: &Arc<OAuthState>,
+    req: TokenRequest,
+) -> Result<Json<TokenResponse>, (StatusCode, Json<TokenError>)> {
+    let code = req
+        .code
+        .ok_or_else(|| bad_grant("code is required for authorization_code grant"))?;
 
     let entry = state
         .auth_codes
         .write()
         .await
-        .remove(&req.code)
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(TokenError {
-                    error: "invalid_grant".into(),
-                    error_description: "invalid or expired authorization code".into(),
-                }),
-            )
-        })?;
+        .remove(&code)
+        .ok_or_else(|| bad_grant("invalid or expired authorization code"))?;
 
     if entry.created_at.elapsed() > AUTH_CODE_TTL {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(TokenError {
-                error: "invalid_grant".into(),
-                error_description: "authorization code expired".into(),
-            }),
-        ));
+        return Err(bad_grant("authorization code expired"));
     }
 
     if entry.client_id != req.client_id {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(TokenError {
-                error: "invalid_grant".into(),
-                error_description: "client_id mismatch".into(),
-            }),
-        ));
+        return Err(bad_grant("client_id mismatch"));
     }
 
     if let Some(ref redirect_uri) = req.redirect_uri
         && *redirect_uri != entry.redirect_uri
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(TokenError {
-                error: "invalid_grant".into(),
-                error_description: "redirect_uri mismatch".into(),
-            }),
-        ));
+        return Err(bad_grant("redirect_uri mismatch"));
     }
 
     // PKCE verification (mandatory per MCP spec 2025-11-25)
-    let verifier = req.code_verifier.as_deref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(TokenError {
-                error: "invalid_grant".into(),
-                error_description: "code_verifier is required (PKCE is mandatory)".into(),
-            }),
-        )
-    })?;
+    let verifier = req
+        .code_verifier
+        .as_deref()
+        .ok_or_else(|| bad_grant("code_verifier is required (PKCE is mandatory)"))?;
 
     if !verify_pkce(verifier, &entry.code_challenge) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(TokenError {
-                error: "invalid_grant".into(),
-                error_description: "PKCE verification failed".into(),
-            }),
-        ));
+        return Err(bad_grant("PKCE verification failed"));
     }
 
+    let (access_token, refresh_token) = mint_token_pair(state, &req.client_id).await;
+    tracing::info!(client_id = %req.client_id, "issued access + refresh token");
+
+    Ok(Json(TokenResponse {
+        access_token,
+        token_type: "bearer".into(),
+        expires_in: TOKEN_TTL.as_secs(),
+        refresh_token,
+    }))
+}
+
+async fn handle_refresh_token(
+    state: &Arc<OAuthState>,
+    req: TokenRequest,
+) -> Result<Json<TokenResponse>, (StatusCode, Json<TokenError>)> {
+    let old_refresh = req
+        .refresh_token
+        .ok_or_else(|| bad_grant("refresh_token is required for refresh_token grant"))?;
+
+    // Rotate: remove the old refresh token atomically. Reuse is rejected.
+    let entry = {
+        let mut rts = state.refresh_tokens.write().await;
+        rts.remove(&old_refresh)
+            .ok_or_else(|| bad_grant("invalid or expired refresh token"))?
+    };
+
+    if entry.created_at.elapsed() > entry.expires_in {
+        return Err(bad_grant("refresh token expired"));
+    }
+
+    if entry.client_id != req.client_id {
+        return Err(bad_grant("client_id mismatch"));
+    }
+
+    let (access_token, refresh_token) = mint_token_pair(state, &req.client_id).await;
+    tracing::info!(client_id = %req.client_id, "refreshed access token (rotated refresh token)");
+
+    Ok(Json(TokenResponse {
+        access_token,
+        token_type: "bearer".into(),
+        expires_in: TOKEN_TTL.as_secs(),
+        refresh_token,
+    }))
+}
+
+async fn mint_token_pair(state: &Arc<OAuthState>, client_id: &str) -> (String, String) {
     let access_token = Uuid::new_v4().to_string();
+    let refresh_token = Uuid::new_v4().to_string();
     let now_epoch_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+
     state.access_tokens.write().await.insert(
         access_token.clone(),
         TokenEntry {
-            client_id: req.client_id.clone(),
+            client_id: client_id.to_string(),
             label: None,
             created_at: Instant::now(),
             created_at_epoch_ms: now_epoch_ms,
@@ -454,13 +500,16 @@ async fn token_handler(
         },
     );
 
-    tracing::info!(client_id = %req.client_id, "issued access token");
+    state.refresh_tokens.write().await.insert(
+        refresh_token.clone(),
+        RefreshTokenEntry {
+            client_id: client_id.to_string(),
+            created_at: Instant::now(),
+            expires_in: REFRESH_TOKEN_TTL,
+        },
+    );
 
-    Ok(Json(TokenResponse {
-        access_token,
-        token_type: "bearer".into(),
-        expires_in: TOKEN_TTL.as_secs(),
-    }))
+    (access_token, refresh_token)
 }
 
 fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
@@ -598,20 +647,48 @@ impl OAuthState {
                 .write()
                 .await
                 .retain(|_, t| t.client_id != client_id);
+            self.refresh_tokens
+                .write()
+                .await
+                .retain(|_, r| r.client_id != client_id);
         }
         removed
     }
 
     pub(crate) async fn revoke_token(&self, token_prefix: &str) -> bool {
         let mut tokens = self.access_tokens.write().await;
-        let key = tokens
-            .keys()
-            .find(|k| k.starts_with(token_prefix))
-            .cloned();
+        let key = tokens.keys().find(|k| k.starts_with(token_prefix)).cloned();
         match key {
             Some(k) => tokens.remove(&k).is_some(),
             None => false,
         }
+    }
+
+    /// Prune expired auth codes, access tokens, and refresh tokens.
+    /// Returns (codes_evicted, access_evicted, refresh_evicted).
+    pub(crate) async fn evict_expired(&self) -> (usize, usize, usize) {
+        let codes_evicted = {
+            let mut codes = self.auth_codes.write().await;
+            let before = codes.len();
+            codes.retain(|_, c| c.created_at.elapsed() < AUTH_CODE_TTL);
+            before - codes.len()
+        };
+
+        let access_evicted = {
+            let mut tokens = self.access_tokens.write().await;
+            let before = tokens.len();
+            tokens.retain(|_, t| t.created_at.elapsed() < t.expires_in);
+            before - tokens.len()
+        };
+
+        let refresh_evicted = {
+            let mut rts = self.refresh_tokens.write().await;
+            let before = rts.len();
+            rts.retain(|_, r| r.created_at.elapsed() < r.expires_in);
+            before - rts.len()
+        };
+
+        (codes_evicted, access_evicted, refresh_evicted)
     }
 
     pub(crate) async fn active_client_count(&self) -> usize {

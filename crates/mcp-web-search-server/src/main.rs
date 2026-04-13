@@ -2,6 +2,7 @@ mod admin;
 mod auth;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use clap::Parser;
@@ -48,16 +49,24 @@ async fn main() -> anyhow::Result<()> {
 
     let ct = CancellationToken::new();
 
-    // MCP service — creates a fresh WebServer per session, sharing one browser
+    // MCP service — creates a fresh WebServer per session, sharing one browser.
+    // SSE keep-alive at 15s: default in rmcp 1.3, but set explicitly so intent is
+    // visible. Keeps idle streams alive through intermediate proxies.
     let browser_for_factory = browser.clone();
     let mcp_service = StreamableHttpService::new(
         move || Ok(WebServer::new_with_arc(browser_for_factory.clone())),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+        StreamableHttpServerConfig::default()
+            .with_cancellation_token(ct.child_token())
+            .with_sse_keep_alive(Some(Duration::from_secs(15))),
     );
 
     let oauth_state = Arc::new(auth::OAuthState::new(admin_password, args.base_url.clone()));
     let admin_state = Arc::new(admin::AdminState::new());
+
+    // Background eviction: prune expired auth codes, access tokens, refresh
+    // tokens, and admin sessions so state can't grow unboundedly.
+    spawn_eviction_task(oauth_state.clone(), admin_state.clone(), ct.child_token());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -101,4 +110,31 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn spawn_eviction_task(
+    oauth: Arc<auth::OAuthState>,
+    admin: Arc<admin::AdminState>,
+    ct: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let (codes, access, refresh) = oauth.evict_expired().await;
+                    let sessions = admin.evict_expired_sessions().await;
+                    if codes + access + refresh + sessions > 0 {
+                        tracing::info!(
+                            codes, access, refresh, admin_sessions = sessions,
+                            "evicted expired auth state",
+                        );
+                    }
+                }
+                _ = ct.cancelled() => break,
+            }
+        }
+        tracing::info!("eviction task stopped");
+    });
 }

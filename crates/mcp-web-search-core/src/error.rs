@@ -11,6 +11,9 @@ pub enum Error {
     #[error("cloudflare challenge did not resolve within {timeout_secs}s")]
     CloudflareTimeout { timeout_secs: u64 },
 
+    #[error("tool call exceeded {budget_secs}s total budget")]
+    Timeout { budget_secs: u64 },
+
     #[error("element not found: {selector}")]
     ElementNotFound { selector: String },
 

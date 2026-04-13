@@ -30,8 +30,19 @@ struct TabGuard(Arc<Tab>);
 
 impl Drop for TabGuard {
     fn drop(&mut self) {
-        self.0.close(true).ok();
+        if let Err(e) = self.0.close(true) {
+            tracing::warn!(error = %e, "tab close failed; may leak browser resources");
+        }
     }
+}
+
+/// Accept a poisoned lock guard instead of panicking. The data under the lock
+/// (a shared Arc<Browser> and a u64 generation counter) is not structurally
+/// invalid just because a prior holder panicked — clearing the poison lets the
+/// next request observe the failure and relaunch Chrome rather than permanently
+/// wedging every future request.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn launch_browser() -> Result<Browser, Error> {
@@ -39,7 +50,6 @@ fn launch_browser() -> Result<Browser, Error> {
         .headless(true)
         .sandbox(false)
         .window_size(Some((1920, 1080)))
-        .idle_browser_timeout(Duration::from_secs(86400 * 30))
         .args(vec![
             OsStr::new("--disable-blink-features=AutomationControlled"),
             OsStr::new("--disable-features=IsolateOrigins,site-per-process"),
@@ -52,13 +62,27 @@ fn launch_browser() -> Result<Browser, Error> {
     Browser::new(launch_options).map_err(Error::BrowserLaunch)
 }
 
+/// Mark the current Chrome instance dead so the next request relaunches it.
+/// Called after a hard timeout, which indicates the browser may be wedged even
+/// if it hasn't returned an error to us.
+fn mark_browser_dead(state: &Mutex<BrowserState>) {
+    let mut s = lock_unpoisoned(state);
+    s.generation = s.generation.wrapping_add(1);
+    // Drop the current Arc<Browser> reference — a fresh launch happens lazily
+    // when the next `new_tab_or_relaunch` call sees `setup_tab` fail.
+    tracing::warn!(
+        generation = s.generation,
+        "marked browser dead after timeout; will relaunch on next request"
+    );
+}
+
 /// Try to create and configure a new tab. If the browser is dead, relaunch
 /// Chrome once and retry. A generation counter ensures that only the first
 /// thread to notice the failure pays the relaunch cost.
 fn new_tab_or_relaunch(state: &Mutex<BrowserState>, user_agent: &str) -> Result<Arc<Tab>, Error> {
     // Fast path: browser is alive
     let (browser, snapshot_gen) = {
-        let s = state.lock().unwrap();
+        let s = lock_unpoisoned(state);
         (s.browser.clone(), s.generation)
     };
 
@@ -68,12 +92,12 @@ fn new_tab_or_relaunch(state: &Mutex<BrowserState>, user_agent: &str) -> Result<
     }
 
     // Slow path: relaunch
-    let mut s = state.lock().unwrap();
+    let mut s = lock_unpoisoned(state);
     if s.generation == snapshot_gen {
         let new_browser = launch_browser()?;
         s.browser = Arc::new(new_browser);
-        s.generation += 1;
-        tracing::info!("Chrome relaunched successfully");
+        s.generation = s.generation.wrapping_add(1);
+        tracing::info!(generation = s.generation, "Chrome relaunched successfully");
     }
     setup_tab(&s.browser, user_agent)
 }
@@ -101,16 +125,20 @@ impl BrowserManager {
     ) -> Result<String, Error> {
         let state = self.state.clone();
         let ua = self.user_agent.clone();
-        let timeout = self.resolve_timeout(timeout_secs);
+        let cf_timeout = self.resolve_timeout(timeout_secs);
+        let budget = self.total_budget(cf_timeout);
 
-        tokio::task::spawn_blocking(move || {
-            let tab = new_tab_or_relaunch(&state, &ua)?;
-            let _guard = TabGuard(tab.clone());
-            navigate_and_wait_for_cf(&tab, &url, timeout)?;
-            tab.get_content()
-                .map_err(|e| Error::Extraction(e.to_string()))
+        self.with_budget(budget, async move {
+            tokio::task::spawn_blocking(move || {
+                let tab = new_tab_or_relaunch(&state, &ua)?;
+                let _guard = TabGuard(tab.clone());
+                navigate_and_wait_for_cf(&tab, &url, cf_timeout)?;
+                tab.get_content()
+                    .map_err(|e| Error::Extraction(e.to_string()))
+            })
+            .await?
         })
-        .await?
+        .await
     }
 
     pub async fn screenshot_page(
@@ -120,21 +148,25 @@ impl BrowserManager {
     ) -> Result<Vec<u8>, Error> {
         let state = self.state.clone();
         let ua = self.user_agent.clone();
-        let timeout = self.resolve_timeout(timeout_secs);
+        let cf_timeout = self.resolve_timeout(timeout_secs);
+        let budget = self.total_budget(cf_timeout);
 
-        tokio::task::spawn_blocking(move || {
-            let tab = new_tab_or_relaunch(&state, &ua)?;
-            let _guard = TabGuard(tab.clone());
-            navigate_and_wait_for_cf(&tab, &url, timeout)?;
-            tab.capture_screenshot(
-                headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
-                None,
-                None,
-                true,
-            )
-            .map_err(Error::Screenshot)
+        self.with_budget(budget, async move {
+            tokio::task::spawn_blocking(move || {
+                let tab = new_tab_or_relaunch(&state, &ua)?;
+                let _guard = TabGuard(tab.clone());
+                navigate_and_wait_for_cf(&tab, &url, cf_timeout)?;
+                tab.capture_screenshot(
+                    headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
+                    None,
+                    None,
+                    true,
+                )
+                .map_err(Error::Screenshot)
+            })
+            .await?
         })
-        .await?
+        .await
     }
 
     pub async fn search(&self, query: String, timeout_secs: Option<u64>) -> Result<String, Error> {
@@ -153,50 +185,85 @@ impl BrowserManager {
     ) -> Result<InteractResult, Error> {
         let state = self.state.clone();
         let ua = self.user_agent.clone();
-        let timeout = self.resolve_timeout(timeout_secs);
+        let cf_timeout = self.resolve_timeout(timeout_secs);
+        let budget = self.total_budget(cf_timeout);
 
-        tokio::task::spawn_blocking(move || {
-            let tab = new_tab_or_relaunch(&state, &ua)?;
-            let _guard = TabGuard(tab.clone());
-            navigate_and_wait_for_cf(&tab, &url, timeout)?;
+        self.with_budget(budget, async move {
+            tokio::task::spawn_blocking(move || {
+                let tab = new_tab_or_relaunch(&state, &ua)?;
+                let _guard = TabGuard(tab.clone());
+                navigate_and_wait_for_cf(&tab, &url, cf_timeout)?;
 
-            for action in &actions {
-                execute_action(&tab, action)?;
-            }
+                for action in &actions {
+                    execute_action(&tab, action)?;
+                }
 
-            // Wait for any final JS rendering
-            std::thread::sleep(Duration::from_millis(500));
+                // Wait for any final JS rendering
+                std::thread::sleep(Duration::from_millis(500));
 
-            let html = tab
-                .get_content()
-                .map_err(|e| Error::Extraction(e.to_string()))?;
+                let html = tab
+                    .get_content()
+                    .map_err(|e| Error::Extraction(e.to_string()))?;
 
-            let final_url = tab.get_url();
+                let final_url = tab.get_url();
 
-            let screenshot = tab
-                .capture_screenshot(
-                    headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
-                    None,
-                    None,
-                    true,
-                )
-                .ok()
-                .map(|bytes| {
-                    use base64::Engine;
-                    base64::engine::general_purpose::STANDARD.encode(&bytes)
-                });
+                let screenshot = tab
+                    .capture_screenshot(
+                        headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
+                        None,
+                        None,
+                        true,
+                    )
+                    .ok()
+                    .map(|bytes| {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                    });
 
-            Ok(InteractResult {
-                html,
-                final_url,
-                screenshot_b64: screenshot,
+                Ok(InteractResult {
+                    html,
+                    final_url,
+                    screenshot_b64: screenshot,
+                })
             })
+            .await?
         })
-        .await?
+        .await
     }
 
     fn resolve_timeout(&self, timeout_secs: Option<u64>) -> Duration {
         Duration::from_secs(timeout_secs.unwrap_or(self.default_timeout.as_secs()))
+    }
+
+    /// Total wall-clock budget for a tool call: the Cloudflare wait plus
+    /// overhead for navigation, content extraction, and screenshotting. Hard-
+    /// capped so a pathological request can't hold a worker forever.
+    fn total_budget(&self, cf_timeout: Duration) -> Duration {
+        const OVERHEAD: Duration = Duration::from_secs(20);
+        const MAX: Duration = Duration::from_secs(60);
+        (cf_timeout + OVERHEAD).min(MAX)
+    }
+
+    /// Enforce the budget. On timeout, mark the browser dead so the next
+    /// request relaunches Chrome — a tab that stalled past the budget may
+    /// have wedged the underlying Chrome process.
+    async fn with_budget<F, T>(&self, budget: Duration, fut: F) -> Result<T, Error>
+    where
+        F: std::future::Future<Output = Result<T, Error>>,
+    {
+        match tokio::time::timeout(budget, fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    budget_secs = budget.as_secs(),
+                    "tool call exceeded budget; marking browser dead"
+                );
+                mark_browser_dead(&self.state);
+                Err(Error::Timeout {
+                    budget_secs: budget.as_secs(),
+                })
+            }
+        }
     }
 }
 
