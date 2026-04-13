@@ -71,6 +71,23 @@ tr:hover td { background: var(--surface2); }
 .mono { font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 0.8rem; }
 
 .empty { text-align: center; padding: 2rem; color: var(--text2); }
+
+/* Create-token panel */
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1.25rem; }
+.panel h3 { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.85rem; }
+.panel form { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+.panel input[type=text], .panel select { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 0.45rem 0.7rem; border-radius: 4px; font-size: 0.85rem; font-family: inherit; }
+.panel input[type=text] { flex: 1; min-width: 200px; }
+.panel input[type=text]:focus, .panel select:focus { outline: none; border-color: var(--accent); }
+.panel .btn-primary { background: var(--accent); color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+.panel .btn-primary:hover { background: var(--accent-hover); }
+.panel .btn-secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+.panel .btn-secondary:hover { background: var(--border); }
+.reveal { margin-top: 1rem; padding: 0.9rem; background: rgba(251,191,36,0.08); border: 1px solid var(--yellow); border-radius: 6px; }
+.reveal .warn { color: var(--yellow); font-size: 0.8rem; margin-bottom: 0.5rem; }
+.reveal .token { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.6rem; word-break: break-all; font-size: 0.8rem; margin-bottom: 0.5rem; }
+.reveal .actions { display: flex; gap: 0.4rem; }
+.badge-admin { background: rgba(91,138,245,0.15); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -182,6 +199,7 @@ function fmtTime(epochMs) {
 }
 
 function fmtDuration(secs) {
+  if (secs >= 86400) return `${Math.floor(secs/86400)}d ${Math.floor((secs%86400)/3600)}h`;
   if (secs >= 3600) return `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m`;
   if (secs >= 60) return `${Math.floor(secs/60)}m ${secs%60}s`;
   return `${secs}s`;
@@ -286,32 +304,119 @@ async function revokeClient(id) {
 // --- Tokens ---
 
 async function renderTokens(c) {
+  // Only rebuild the shell (form + list container) when we're entering
+  // the view fresh — auto-refresh should never wipe the user's form input.
+  if (!document.getElementById('tokens-create')) {
+    c.innerHTML = `
+      <div id="tokens-create" class="panel">
+        <h3>Create bearer token</h3>
+        <form onsubmit="createToken(event)">
+          <input type="text" id="token-label" placeholder="Label (e.g. laptop, ci-pipeline)" maxlength="64">
+          <select id="token-ttl">
+            <option value="3600">1 hour</option>
+            <option value="86400">1 day</option>
+            <option value="604800" selected>7 days</option>
+            <option value="2592000">30 days</option>
+            <option value="31536000">1 year</option>
+          </select>
+          <button type="submit" class="btn-primary">Create</button>
+        </form>
+        <div id="token-reveal"></div>
+      </div>
+      <div id="tokens-list"></div>`;
+  }
+  await renderTokensList();
+}
+
+async function renderTokensList() {
+  const list = document.getElementById('tokens-list');
+  if (!list) return;
   const d = await api('/tokens');
   if (!d) return;
   if (d.tokens.length === 0) {
-    c.innerHTML = '<div class="empty">No active tokens.</div>';
+    list.innerHTML = '<div class="empty">No active tokens.</div>';
     return;
   }
-  const rows = d.tokens.map(t => `
-    <tr>
-      <td class="mono">${t.token_prefix}...</td>
-      <td class="mono">${t.client_id.slice(0, 8)}...</td>
-      <td>${fmtTime(t.created_at_epoch_ms)}</td>
-      <td>${fmtDuration(t.remaining_secs)}</td>
-      <td><button class="btn-danger" onclick="revokeToken('${t.token_prefix}')">Revoke</button></td>
-    </tr>`).join('');
+  const rows = d.tokens.map(t => {
+    const isAdmin = t.client_id === 'admin';
+    const client = isAdmin
+      ? '<span class="badge badge-admin">admin</span>'
+      : `<span class="mono">${escHtml(t.client_id.slice(0, 8))}...</span>`;
+    const label = t.label ? escHtml(t.label) : '<span style="color:var(--text2)">—</span>';
+    return `
+      <tr>
+        <td class="mono">${t.token_prefix}...</td>
+        <td>${label}</td>
+        <td>${client}</td>
+        <td>${fmtTime(t.created_at_epoch_ms)}</td>
+        <td>${fmtDuration(t.remaining_secs)}</td>
+        <td><button class="btn-danger" onclick="revokeToken('${t.token_prefix}')">Revoke</button></td>
+      </tr>`;
+  }).join('');
 
-  c.innerHTML = `
+  list.innerHTML = `
     <table>
-      <thead><tr><th>Token</th><th>Client</th><th>Created</th><th>Remaining</th><th></th></tr></thead>
+      <thead><tr><th>Token</th><th>Label</th><th>Client</th><th>Created</th><th>Remaining</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
+}
+
+async function createToken(e) {
+  e.preventDefault();
+  const label = document.getElementById('token-label').value;
+  const ttl = parseInt(document.getElementById('token-ttl').value, 10);
+  const res = await fetch(`${API}/tokens`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({label: label || null, expires_in_secs: ttl}),
+  });
+  if (res.status === 401) { location.reload(); return; }
+  if (!res.ok) {
+    alert('Failed to create token');
+    return;
+  }
+  const data = await res.json();
+  const reveal = document.getElementById('token-reveal');
+  // Stash the raw token on the element to avoid interpolating it into an
+  // onclick attribute (which would require escaping and is leak-prone).
+  reveal._token = data.access_token;
+  reveal.innerHTML = `
+    <div class="reveal">
+      <div class="warn">Copy this token now — it will not be shown again.</div>
+      <div class="token mono">${escHtml(data.access_token)}</div>
+      <div class="actions">
+        <button class="btn-secondary" onclick="copyRevealedToken(this)">Copy</button>
+        <button class="btn-secondary" onclick="dismissReveal()">Dismiss</button>
+      </div>
+    </div>`;
+  document.getElementById('token-label').value = '';
+  renderTokensList();
+}
+
+async function copyRevealedToken(btn) {
+  const reveal = document.getElementById('token-reveal');
+  if (!reveal || !reveal._token) return;
+  try {
+    await navigator.clipboard.writeText(reveal._token);
+    const original = btn.textContent;
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.textContent = original; }, 1500);
+  } catch (_) {
+    alert('Clipboard write failed — copy manually.');
+  }
+}
+
+function dismissReveal() {
+  const reveal = document.getElementById('token-reveal');
+  if (!reveal) return;
+  reveal._token = null;
+  reveal.innerHTML = '';
 }
 
 async function revokeToken(prefix) {
   if (!confirm('Revoke this token?')) return;
   await apiDelete(`/tokens/${prefix}`);
-  render();
+  renderTokensList();
 }
 
 // --- Utils ---

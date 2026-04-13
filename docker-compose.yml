@@ -5,24 +5,19 @@ services:
     environment:
       MCP_ADMIN_PASSWORD: ${MCP_ADMIN_PASSWORD}
       RUST_LOG: info
+    networks:
+      - default
+      - traefik
     labels:
       - traefik.enable=true
+      - traefik.docker.network=traefik_default
       - traefik.http.routers.mcp.rule=Host(`${MCP_HOST}`)
       - traefik.http.routers.mcp.entrypoints=websecure
       - traefik.http.routers.mcp.tls.certresolver=letsencrypt
       - traefik.http.services.mcp.loadbalancer.server.port=3000
     restart: unless-stopped
 
+networks:
   traefik:
-    image: traefik:v3
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./deploy/traefik.yml:/etc/traefik/traefik.yml:ro
-      - traefik-certs:/certs
-    restart: unless-stopped
-
-volumes:
-  traefik-certs:
+    external: true
+    name: traefik_default

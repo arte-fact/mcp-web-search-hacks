@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use headless_chrome::{Browser, LaunchOptions, Tab};
@@ -7,9 +7,14 @@ use headless_chrome::{Browser, LaunchOptions, Tab};
 use crate::error::Error;
 
 pub struct BrowserManager {
-    browser: Arc<Browser>,
+    state: Arc<Mutex<BrowserState>>,
     default_timeout: Duration,
     user_agent: String,
+}
+
+struct BrowserState {
+    browser: Arc<Browser>,
+    generation: u64,
 }
 
 impl std::fmt::Debug for BrowserManager {
@@ -29,26 +34,59 @@ impl Drop for TabGuard {
     }
 }
 
+fn launch_browser() -> Result<Browser, Error> {
+    let launch_options = LaunchOptions::default_builder()
+        .headless(true)
+        .sandbox(false)
+        .window_size(Some((1920, 1080)))
+        .idle_browser_timeout(Duration::from_secs(86400 * 30))
+        .args(vec![
+            OsStr::new("--disable-blink-features=AutomationControlled"),
+            OsStr::new("--disable-features=IsolateOrigins,site-per-process"),
+            OsStr::new("--disable-infobars"),
+            OsStr::new("--no-first-run"),
+        ])
+        .build()
+        .map_err(|e| Error::BrowserLaunch(e.into()))?;
+
+    Browser::new(launch_options).map_err(Error::BrowserLaunch)
+}
+
+/// Try to create and configure a new tab. If the browser is dead, relaunch
+/// Chrome once and retry. A generation counter ensures that only the first
+/// thread to notice the failure pays the relaunch cost.
+fn new_tab_or_relaunch(state: &Mutex<BrowserState>, user_agent: &str) -> Result<Arc<Tab>, Error> {
+    // Fast path: browser is alive
+    let (browser, snapshot_gen) = {
+        let s = state.lock().unwrap();
+        (s.browser.clone(), s.generation)
+    };
+
+    match setup_tab(&browser, user_agent) {
+        Ok(tab) => return Ok(tab),
+        Err(e) => tracing::warn!(error = %e, "tab creation failed, relaunching Chrome"),
+    }
+
+    // Slow path: relaunch
+    let mut s = state.lock().unwrap();
+    if s.generation == snapshot_gen {
+        let new_browser = launch_browser()?;
+        s.browser = Arc::new(new_browser);
+        s.generation += 1;
+        tracing::info!("Chrome relaunched successfully");
+    }
+    setup_tab(&s.browser, user_agent)
+}
+
 impl BrowserManager {
     pub fn launch() -> Result<Self, Error> {
-        let launch_options = LaunchOptions::default_builder()
-            .headless(true)
-            .sandbox(false)
-            .window_size(Some((1920, 1080)))
-            .idle_browser_timeout(Duration::from_secs(600))
-            .args(vec![
-                OsStr::new("--disable-blink-features=AutomationControlled"),
-                OsStr::new("--disable-features=IsolateOrigins,site-per-process"),
-                OsStr::new("--disable-infobars"),
-                OsStr::new("--no-first-run"),
-            ])
-            .build()
-            .map_err(|e| Error::BrowserLaunch(e.into()))?;
-
-        let browser = Browser::new(launch_options).map_err(Error::BrowserLaunch)?;
+        let browser = launch_browser()?;
 
         Ok(Self {
-            browser: Arc::new(browser),
+            state: Arc::new(Mutex::new(BrowserState {
+                browser: Arc::new(browser),
+                generation: 0,
+            })),
             default_timeout: Duration::from_secs(10),
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                          (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -61,12 +99,12 @@ impl BrowserManager {
         url: String,
         timeout_secs: Option<u64>,
     ) -> Result<String, Error> {
-        let browser = self.browser.clone();
+        let state = self.state.clone();
         let ua = self.user_agent.clone();
         let timeout = self.resolve_timeout(timeout_secs);
 
         tokio::task::spawn_blocking(move || {
-            let tab = setup_tab(&browser, &ua)?;
+            let tab = new_tab_or_relaunch(&state, &ua)?;
             let _guard = TabGuard(tab.clone());
             navigate_and_wait_for_cf(&tab, &url, timeout)?;
             tab.get_content()
@@ -80,12 +118,12 @@ impl BrowserManager {
         url: String,
         timeout_secs: Option<u64>,
     ) -> Result<Vec<u8>, Error> {
-        let browser = self.browser.clone();
+        let state = self.state.clone();
         let ua = self.user_agent.clone();
         let timeout = self.resolve_timeout(timeout_secs);
 
         tokio::task::spawn_blocking(move || {
-            let tab = setup_tab(&browser, &ua)?;
+            let tab = new_tab_or_relaunch(&state, &ua)?;
             let _guard = TabGuard(tab.clone());
             navigate_and_wait_for_cf(&tab, &url, timeout)?;
             tab.capture_screenshot(
@@ -113,12 +151,12 @@ impl BrowserManager {
         actions: Vec<PageAction>,
         timeout_secs: Option<u64>,
     ) -> Result<InteractResult, Error> {
-        let browser = self.browser.clone();
+        let state = self.state.clone();
         let ua = self.user_agent.clone();
         let timeout = self.resolve_timeout(timeout_secs);
 
         tokio::task::spawn_blocking(move || {
-            let tab = setup_tab(&browser, &ua)?;
+            let tab = new_tab_or_relaunch(&state, &ua)?;
             let _guard = TabGuard(tab.clone());
             navigate_and_wait_for_cf(&tab, &url, timeout)?;
 

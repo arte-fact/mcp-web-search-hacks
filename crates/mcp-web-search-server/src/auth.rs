@@ -41,6 +41,7 @@ struct AuthCodeEntry {
 
 struct TokenEntry {
     client_id: String,
+    label: Option<String>,
     created_at: Instant,
     created_at_epoch_ms: u64,
     expires_in: Duration,
@@ -48,6 +49,13 @@ struct TokenEntry {
 
 const AUTH_CODE_TTL: Duration = Duration::from_secs(600);
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
+const MAX_ADMIN_TOKEN_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Sentinel client_id for bearer tokens minted directly from the admin panel
+/// (i.e. not via the OAuth authorization code flow). It intentionally doesn't
+/// correspond to any registered OAuth client — `list_clients`/`revoke_client`
+/// look up real clients by UUID, so the sentinel never collides.
+pub(crate) const ADMIN_TOKEN_CLIENT_ID: &str = "admin";
 
 impl OAuthState {
     pub fn new(admin_password: String, base_url: String) -> Self {
@@ -439,6 +447,7 @@ async fn token_handler(
         access_token.clone(),
         TokenEntry {
             client_id: req.client_id.clone(),
+            label: None,
             created_at: Instant::now(),
             created_at_epoch_ms: now_epoch_ms,
             expires_in: TOKEN_TTL,
@@ -478,9 +487,18 @@ pub(crate) struct ClientInfo {
 pub(crate) struct TokenInfo {
     pub token_prefix: String,
     pub client_id: String,
+    pub label: Option<String>,
     pub created_at_epoch_ms: u64,
     pub expires_in_secs: u64,
     pub remaining_secs: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CreatedAdminToken {
+    pub access_token: String,
+    pub token_prefix: String,
+    pub label: Option<String>,
+    pub expires_in_secs: u64,
 }
 
 impl OAuthState {
@@ -522,12 +540,55 @@ impl OAuthState {
                 Some(TokenInfo {
                     token_prefix: full_token[..8.min(full_token.len())].to_string(),
                     client_id: t.client_id.clone(),
+                    label: t.label.clone(),
                     created_at_epoch_ms: t.created_at_epoch_ms,
                     expires_in_secs: t.expires_in.as_secs(),
                     remaining_secs: remaining.as_secs(),
                 })
             })
             .collect()
+    }
+
+    /// Mint a bearer token directly (no OAuth flow). Used by the admin panel
+    /// to hand out long-lived tokens for MCP clients that don't support OAuth.
+    /// The TTL is clamped to [`MAX_ADMIN_TOKEN_TTL`].
+    pub(crate) async fn create_admin_token(
+        &self,
+        label: Option<String>,
+        ttl: Duration,
+    ) -> CreatedAdminToken {
+        let ttl = ttl.min(MAX_ADMIN_TOKEN_TTL);
+        let access_token = Uuid::new_v4().to_string();
+        let token_prefix = access_token[..8.min(access_token.len())].to_string();
+        let created_at_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        self.access_tokens.write().await.insert(
+            access_token.clone(),
+            TokenEntry {
+                client_id: ADMIN_TOKEN_CLIENT_ID.to_string(),
+                label: label.clone(),
+                created_at: Instant::now(),
+                created_at_epoch_ms,
+                expires_in: ttl,
+            },
+        );
+
+        tracing::info!(
+            token_prefix = %token_prefix,
+            label = ?label,
+            ttl_secs = ttl.as_secs(),
+            "admin panel issued bearer token"
+        );
+
+        CreatedAdminToken {
+            access_token,
+            token_prefix,
+            label,
+            expires_in_secs: ttl.as_secs(),
+        }
     }
 
     pub(crate) async fn revoke_client(&self, client_id: &str) -> bool {

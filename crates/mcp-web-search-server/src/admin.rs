@@ -74,7 +74,7 @@ pub fn router(oauth: Arc<OAuthState>, admin: Arc<AdminState>) -> Router {
         .route("/logs", get(logs_handler))
         .route("/clients", get(clients_handler))
         .route("/clients/{client_id}", delete(delete_client_handler))
-        .route("/tokens", get(tokens_handler))
+        .route("/tokens", get(tokens_handler).post(create_token_handler))
         .route("/tokens/{token_prefix}", delete(delete_token_handler))
         .layer(axum::middleware::from_fn_with_state(
             combined.clone(),
@@ -388,6 +388,37 @@ async fn tokens_handler(State(state): State<AdminAppState>) -> Json<serde_json::
     let (oauth, _) = state.as_ref();
     let tokens = oauth.list_tokens().await;
     Json(serde_json::json!({ "tokens": tokens }))
+}
+
+#[derive(Deserialize)]
+struct CreateTokenRequest {
+    label: Option<String>,
+    expires_in_secs: Option<u64>,
+}
+
+async fn create_token_handler(
+    State(state): State<AdminAppState>,
+    Json(req): Json<CreateTokenRequest>,
+) -> Response {
+    let (oauth, _) = state.as_ref();
+
+    let label = req
+        .label
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Default 1 hour to match OAuth-minted tokens; cap is enforced inside OAuthState.
+    let ttl = Duration::from_secs(req.expires_in_secs.unwrap_or(3600));
+    if ttl.is_zero() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "expires_in_secs must be > 0"})),
+        )
+            .into_response();
+    }
+
+    let created = oauth.create_admin_token(label, ttl).await;
+    (StatusCode::CREATED, Json(created)).into_response()
 }
 
 async fn delete_token_handler(
