@@ -256,7 +256,43 @@ async fn authorize_page(
         }
     }
 
-    let html = format!(
+    let html = render_authorize_page(
+        &q.client_id,
+        &q.redirect_uri,
+        q.state.as_deref().unwrap_or(""),
+        code_challenge,
+        q.scope.as_deref(),
+    );
+
+    Ok(Html(html))
+}
+
+/// Escape a value for use in HTML text or a double-quoted attribute.
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the authorization form. Every value comes from the query string or
+/// from open client registration, so all of them are escaped.
+fn render_authorize_page(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+    scope: Option<&str>,
+) -> String {
+    format!(
         r#"<!DOCTYPE html>
 <html>
 <head><title>MCP Server Authorization</title>
@@ -283,18 +319,14 @@ button:hover {{ background: #1d4ed8; }}
 </form>
 </body>
 </html>"#,
-        client_id = q.client_id,
-        redirect_uri = q.redirect_uri,
-        state = q.state.as_deref().unwrap_or(""),
-        code_challenge = code_challenge,
-        scope = q
-            .scope
-            .as_ref()
-            .map(|s| format!(" (scope: {s})"))
+        client_id = html_escape(client_id),
+        redirect_uri = html_escape(redirect_uri),
+        state = html_escape(state),
+        code_challenge = html_escape(code_challenge),
+        scope = scope
+            .map(|s| format!(" (scope: {})", html_escape(s)))
             .unwrap_or_default(),
-    );
-
-    Ok(Html(html))
+    )
 }
 
 #[derive(Deserialize)]
@@ -755,5 +787,51 @@ pub async fn auth_middleware(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAYLOAD: &str = r#""><script>alert(1)</script>"#;
+
+    #[test]
+    fn html_escape_neutralises_markup_and_quotes() {
+        assert_eq!(
+            html_escape(r#"<a href="x" id='y'>&</a>"#),
+            "&lt;a href=&quot;x&quot; id=&#x27;y&#x27;&gt;&amp;&lt;/a&gt;"
+        );
+    }
+
+    #[test]
+    fn authorize_page_escapes_redirect_uri_state_and_scope() {
+        let redirect_uri = format!("https://evil.example/cb{PAYLOAD}");
+        let html =
+            render_authorize_page("client", &redirect_uri, PAYLOAD, "challenge", Some(PAYLOAD));
+
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains(PAYLOAD));
+        // Three injected values, each rendered escaped.
+        assert_eq!(
+            html.matches("&lt;script&gt;alert(1)&lt;/script&gt;")
+                .count(),
+            3
+        );
+        assert!(html.contains("value=\"https://evil.example/cb&quot;&gt;&lt;script&gt;"));
+    }
+
+    #[test]
+    fn authorize_page_keeps_plain_values_intact() {
+        let html = render_authorize_page(
+            "client",
+            "https://app.example/cb?x=1",
+            "abc",
+            "challenge",
+            None,
+        );
+        assert!(html.contains(r#"name="redirect_uri" value="https://app.example/cb?x=1""#));
+        assert!(html.contains(r#"name="state" value="abc""#));
+        assert!(!html.contains("scope:"));
     }
 }
