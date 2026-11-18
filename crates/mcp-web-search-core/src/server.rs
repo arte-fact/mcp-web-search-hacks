@@ -67,10 +67,16 @@ const MAX_TEXT_LENGTH: usize = 50_000;
 
 fn truncate_text(text: String) -> String {
     if text.len() > MAX_TEXT_LENGTH {
+        // Cut on a char boundary: slicing at a fixed byte offset panics when it
+        // lands inside a multi-byte character (any accented page can hit this).
+        let mut end = MAX_TEXT_LENGTH;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
         format!(
             "{}...\n[truncated, {} total chars]",
-            &text[..MAX_TEXT_LENGTH],
-            text.len()
+            &text[..end],
+            text.chars().count()
         )
     } else {
         text
@@ -224,5 +230,34 @@ impl ServerHandler for WebServer {
                  rendering and Cloudflare challenges automatically using a headless browser."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_text_is_returned_unchanged() {
+        assert_eq!(truncate_text("héllo".to_string()), "héllo");
+    }
+
+    #[test]
+    fn ascii_text_is_cut_at_the_limit() {
+        let out = truncate_text("a".repeat(MAX_TEXT_LENGTH + 10));
+        assert!(out.starts_with(&"a".repeat(MAX_TEXT_LENGTH)));
+        assert!(out.contains(&format!("{} total chars", MAX_TEXT_LENGTH + 10)));
+    }
+
+    #[test]
+    fn multibyte_char_straddling_the_limit_does_not_panic() {
+        // 'é' is 2 bytes: after one ASCII byte, every 'é' straddles an even
+        // offset, so byte MAX_TEXT_LENGTH falls in the middle of a character.
+        let text = format!("a{}", "é".repeat(MAX_TEXT_LENGTH));
+        assert!(!text.is_char_boundary(MAX_TEXT_LENGTH));
+        let out = truncate_text(text);
+        let kept = out.split("...\n[truncated").next().unwrap();
+        assert_eq!(kept.len(), MAX_TEXT_LENGTH - 1);
+        assert!(kept.ends_with('é'));
     }
 }
